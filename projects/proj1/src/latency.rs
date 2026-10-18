@@ -1,6 +1,9 @@
 use std::env;
+use std::thread;
 use std::fs::File;
+use std::sync::Arc;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use rand::{rng, Rng, RngExt, SeedableRng};
 use rand::rngs::StdRng;
 
@@ -42,23 +45,24 @@ impl Iterator for RandomOrderIterator {
     }
 }
 
-const BLOCK_SIZE: u64 = 512;
 const RAND_SEED: u64 = 1234;
 
 fn main() {
 
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        println!("Usage: cargo run --release --bin latency filepath");
+    if args.len() != 4 {
+        println!("Usage: cargo run --release --bin latency filepath threads block_size");
         return;
     }
+    let num_threads: usize = args[2].parse().unwrap();
+    let block_size: u64 = args[3].parse().unwrap();
 
     let file_res = File::open(args[1].clone());
     if file_res.is_err() {
         eprintln!("File not found: {}", args[1]);
         return;
     }
-    let file = file_res.unwrap();
+    let file = Arc::new(file_res.unwrap());
 
     let metadata = file.metadata();
     if metadata.is_err() {
@@ -66,28 +70,50 @@ fn main() {
         return;
     }
     let total_size = metadata.unwrap().len();
-    let num_blocks = (total_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_blocks = (total_size + block_size - 1) / block_size;
     let random_iter = RandomOrderIterator::with_seed(num_blocks, RAND_SEED);
 
-    let mut buffer = vec![0u8; BLOCK_SIZE as usize];
     let mut result = vec![0u8; 16];
-    for block_idx in random_iter
-    {
-        let offset = block_idx * BLOCK_SIZE;
-        let bytes_to_read = std::cmp::min(BLOCK_SIZE, total_size - offset) as usize;
+    let block_idxs = Arc::new(random_iter.collect::<Vec<u64>>());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let read_ns = Arc::new(AtomicU64::new(0));
 
-        // read
-        let target_buf = &mut buffer[..bytes_to_read];
-        let err = file.read_exact_at(target_buf, offset);
-        if err.is_err() {
-            eprintln!("Error reading file: {}", err.unwrap_err());
-            return;
-        }
+    let handles = (0..num_threads).map(|thread_idx| {
+        let file_clone = Arc::clone(&file);
+        let block_idxs_clone = Arc::clone(&block_idxs);
+        let tx_clone = tx.clone();
+        let read_ns_clone = Arc::clone(&read_ns);
 
-        // compute
-        let block_hash = md5::compute(target_buf);
-        sum_block_hash(&mut result, &block_hash);
+        thread::spawn(move || {
+            for block_idx in block_idxs_clone.iter().skip(thread_idx).step_by(num_threads) {
+                let offset = block_idx * block_size;
+                let bytes_to_read = std::cmp::min(block_size, total_size - offset) as usize;
+                let mut buffer = vec![0u8; bytes_to_read];
+
+                // read
+                let start = std::time::Instant::now();
+                let err = file_clone.read_exact_at(&mut buffer, offset);
+                let elapsed = start.elapsed();
+                if err.is_err() {
+                    eprintln!("Error reading file: {}", err.unwrap_err());
+                    std::process::exit(1);
+                }
+                read_ns_clone.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+
+                tx_clone.send(buffer).unwrap();
+            }
+        })
+    }).collect::<Vec<_>>();
+    drop(tx);
+
+    for msg in rx {
+        sum_block_hash(&mut result, &md5::compute(&msg));
     }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    eprintln!("avg_read_us={}", read_ns.load(Ordering::Relaxed) as f64 / num_blocks as f64 / 1000.0);
     print!("{} 0x", args[1].clone());
     for byte in &result {
         print!("{:02x}", byte);
